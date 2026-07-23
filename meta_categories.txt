@@ -1,0 +1,79 @@
+# meta_categories.txt
+# ─────────────────────────────────────────────────────────────
+# Defines narrative "meta" categories the bot checks each token against.
+# Edit this anytime — the bot re-reads it every cycle, no restart needed.
+#
+# Format: a category name in [brackets], then one keyword per line
+# underneath it. Lines starting with # are ignored.
+#
+# A token matches a category if any of that category's keywords appear
+# in its name/symbol/description (same loose substring match as the
+# trending keyword system, 3+ characters only to avoid false positives).
+
+[ai_agent]
+agent
+gpt
+assistant
+bot
+neural
+llm
+
+[dog]
+dog
+shiba
+inu
+doge
+puppy
+corgi
+retriever
+pup
+
+[cat]
+cat
+kitty
+feline
+meow
+neko
+
+[frog]
+pepe
+frog
+toad
+kek
+froggy
+
+[political]
+trump
+biden
+election
+politic
+maga
+potus
+senate
+
+[finance_meta]
+bank
+fed
+rate
+treasury
+stock
+wall street
+
+[celebrity]
+elon
+musk
+kanye
+drake
+celebrity
+
+[animal_other]
+monkey
+ape
+bird
+bear
+bull
+pig
+whale
+
+# Add more categories as new metas emerge — just follow the same
+# [category_name] then keyword-per-line format.
