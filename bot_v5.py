@@ -264,6 +264,10 @@ ENABLE_DIP_REENTRY_ALERTS      = True
 # A fast flush proves itself in ~1-2 min; a slow grind needs longer, since
 # a brief pause mid-bleed can look identical to a real bottom over a
 # single poll.
+DIP_REENTRY_LOW_TOLERANCE_PCT              = 3.0   # a wick up to 3% below
+                                                     # the tracked low still
+                                                     # counts as "holding,"
+                                                     # not a fresh leg down
 DIP_REENTRY_FAST_DUMP_RATE_PCT_PER_MIN     = 15
 DIP_REENTRY_MODERATE_DUMP_RATE_PCT_PER_MIN = 5
 DIP_REENTRY_BOTTOM_DWELL_FAST_MIN     = 1.5   # dump_rate > 15%/min
@@ -1405,10 +1409,14 @@ def detect_dip_reentry(token_address: str, current_price: float, pair: dict) -> 
         return False
 
     # Step 1: still finding the bottom? Track the lowest price seen since
-    # the peak, and reset the dwell/confirmation counters every time a new
-    # low appears — a new low means the previous "bottom" wasn't one.
+    # the peak. A memecoin wobbles constantly at 30s polling — requiring
+    # price to never undercut one exact tick across several consecutive
+    # polls would almost never survive in practice. So only a genuine
+    # breach past a small tolerance below the tracked low counts as "still
+    # dumping" and restarts the cycle; a minor wick within tolerance is
+    # treated as noise around the same bottom, not a new leg down.
     low_since_peak = state.get("price_low_since_peak")
-    if low_since_peak is None or current_price < low_since_peak:
+    if low_since_peak is None:
         state["price_low_since_peak"]    = current_price
         state["price_low_set_at"]        = time.time()
         state["no_new_low_count"]        = 0
@@ -1419,6 +1427,24 @@ def detect_dip_reentry(token_address: str, current_price: float, pair: dict) -> 
 
     if low_since_peak <= 0:
         return False
+
+    tolerance_floor = low_since_peak * (1 - DIP_REENTRY_LOW_TOLERANCE_PCT / 100)
+    if current_price < tolerance_floor:
+        # real new leg down, not noise — restart the bottom-tracking cycle
+        state["price_low_since_peak"]    = current_price
+        state["price_low_set_at"]        = time.time()
+        state["no_new_low_count"]        = 0
+        state["dump_baseline_vol5m"]     = None
+        state["dump_baseline_buy_ratio"] = None
+        state["recovery_confirm_count"]  = 0
+        return False
+
+    # Within tolerance of the existing low. If this tick is still slightly
+    # lower, keep the tracked low accurate for the recovery-ratio math —
+    # but WITHOUT resetting the dwell timer, since it's the same bottom.
+    if current_price < low_since_peak:
+        state["price_low_since_peak"] = current_price
+        low_since_peak = current_price
 
     state["no_new_low_count"] = state.get("no_new_low_count", 0) + 1
 
