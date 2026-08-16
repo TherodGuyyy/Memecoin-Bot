@@ -250,9 +250,46 @@ LIQUIDITY_RUG_DROP_PCT = 75   # presume rugged if liquidity drops this % or
                               # more from where it was when first tracked
 
 ENABLE_DIP_REENTRY_ALERTS      = True
-DIP_REENTRY_MIN_BOUNCE_STRONG_LORE = 5    # % bounce needed if it had a
-                                           # trending-keyword match at launch
-DIP_REENTRY_MIN_BOUNCE_WEAK_LORE   = 12   # % bounce needed if it didn't
+
+# Rebuilt from a Telegram-history analysis of ~1,600 past re-entry alerts.
+# The old version fired the instant price ticked up off its low at all —
+# a single whale buy into a thin, dying pool could produce that pattern.
+# It's now a small state machine: confirm the low actually HELD (not just
+# one uptick), then require the bounce to reclaim a real fraction of the
+# drop back toward the old peak, with real buy pressure behind it — not
+# just any bounce + any volume.
+
+# ── Step 1: how long the low must hold before it counts as "bottomed" ───────
+# Scaled to how violent the dump was (measured in % dropped per minute).
+# A fast flush proves itself in ~1-2 min; a slow grind needs longer, since
+# a brief pause mid-bleed can look identical to a real bottom over a
+# single poll.
+DIP_REENTRY_FAST_DUMP_RATE_PCT_PER_MIN     = 15
+DIP_REENTRY_MODERATE_DUMP_RATE_PCT_PER_MIN = 5
+DIP_REENTRY_BOTTOM_DWELL_FAST_MIN     = 1.5   # dump_rate > 15%/min
+DIP_REENTRY_BOTTOM_DWELL_MODERATE_MIN = 2.5   # dump_rate > 5%/min
+DIP_REENTRY_BOTTOM_DWELL_SLOW_MIN     = 4.0   # dump_rate <= 5%/min
+
+# ── Step 2: how much of the drop must be recovered once bottomed ───────────
+# Fraction of the peak-to-low drop that must be reclaimed — 1.0 means back
+# at the old peak, 0.75 means 3/4 of the way there. The historical data
+# showed this single number was the strongest predictor of a real 2x/3x+
+# vs a dead-cat bounce: alerts that only reclaimed <0.5 of the drop hit
+# 2x just 14.9% of the time; alerts that got back to ~0.9-1.1x of the peak
+# hit 2x 35.1% of the time (and 3x 23.1% of the time). Same lore-tiered
+# leniency as before — a trending-keyword match clears an easier bar.
+DIP_REENTRY_MIN_RECOVERY_STRONG_LORE = 0.75
+DIP_REENTRY_MIN_RECOVERY_WEAK_LORE   = 0.95
+
+# ── Step 3: real buying behind the bounce, not just any volume ─────────────
+DIP_REENTRY_MIN_BUY_RATIO         = 0.35  # 35%+ of 5m txns must be buys
+DIP_REENTRY_MIN_VOLUME_RISE_RATIO = 1.1   # 5m volume must be at least 10%
+                                           # above what it was the moment
+                                           # the bottom was first confirmed
+
+# ── Step 4: must hold, not just tick once ───────────────────────────────────
+DIP_REENTRY_CONFIRM_POLLS = 2   # consecutive polls the above must all be
+                                 # true before the alert actually fires
 
 # ── Multiplier alerts (NEW) ───────────────────────────────────────────────────
 # Fires once per milestone as a token's price/market cap climbs from where
@@ -805,7 +842,13 @@ async def process_new_gmgn_token(bot: Bot, token: dict) -> None:
         "first_seen":          time.time(),
         "initial_price":       price_now,
         "price_high":          price_now,
+        "price_high_set_at":   time.time(),
         "price_low_since_peak": None,
+        "price_low_set_at":    None,
+        "no_new_low_count":    0,
+        "dump_baseline_vol5m":     None,
+        "dump_baseline_buy_ratio": None,
+        "recovery_confirm_count":  0,
         "alerted_reentry":     False,
         "initial_liquidity":   None,   # NEW: captured on first DEXScreener
                                         # fetch during the scan loop, since
@@ -1298,16 +1341,58 @@ def detect_volume_spike(pair: dict) -> bool:
     return avg_5m > 0 and vol_5m >= avg_5m * VOLUME_SPIKE_RATIO
 
 
-def detect_dip_reentry(token_address: str, current_price: float, vol_spike: bool) -> bool:
-    """Returns True the FIRST time a token shows the 'dipped from its peak,
-    found a bottom, and is now bouncing back with fresh volume' pattern.
-    Only fires once per token.
+def recovery_ratio_since_low(peak: float, low: float, current: float) -> float:
+    """Fraction of the peak-to-low drop that's been recovered: 0.0 = still
+    sitting at the low, 1.0 = fully back at the old peak, >1.0 = broke
+    above it. Shared by detect_dip_reentry() and format_dip_reentry_alert()
+    so the two can never disagree on the math."""
+    if not peak or low is None or peak <= low:
+        return 0.0
+    return (current - low) / (peak - low)
 
-    No fixed drop-percentage window — dip depth varies too much per coin
-    to gate on that. Instead, the bounce-off-low bar itself is stricter or
-    looser depending on how strong the token's lore looked at launch (a
-    trending-keyword match = easier bar to clear, no lore signal = needs a
-    bigger bounce to prove itself)."""
+
+def required_bottom_dwell_polls(drop_pct: float, dump_minutes: float) -> int:
+    """How many consecutive polls the low must hold (no new low) before a
+    dip counts as 'bottomed' — scaled to how violent the dump was. A fast
+    flush proves itself quickly; a slow grind needs longer, since a brief
+    pause mid-bleed can look identical to a real bottom over a single
+    poll."""
+    dump_minutes = max(dump_minutes, 0.1)  # guard divide-by-zero when the
+                                            # low is set on the very next
+                                            # poll after the peak
+    dump_rate = drop_pct / dump_minutes    # % dropped per minute
+
+    if dump_rate > DIP_REENTRY_FAST_DUMP_RATE_PCT_PER_MIN:
+        dwell_minutes = DIP_REENTRY_BOTTOM_DWELL_FAST_MIN
+    elif dump_rate > DIP_REENTRY_MODERATE_DUMP_RATE_PCT_PER_MIN:
+        dwell_minutes = DIP_REENTRY_BOTTOM_DWELL_MODERATE_MIN
+    else:
+        dwell_minutes = DIP_REENTRY_BOTTOM_DWELL_SLOW_MIN
+
+    polls = round(dwell_minutes * 60 / POLL_INTERVAL_SECONDS)
+    return max(polls, 1)
+
+
+def detect_dip_reentry(token_address: str, current_price: float, pair: dict) -> bool:
+    """Returns True the FIRST time a token shows a CONFIRMED 'survived the
+    dump, bottomed out, and is now genuinely recovering' pattern. Fires at
+    most once per token.
+
+    Rebuilt as a small state machine (previously fired on a single-poll
+    bounce + volume-spike check, which could trigger on one whale buy into
+    an already-dying pool):
+      1. Track the low since the peak. Any new low resets the dwell timer —
+         still mid-dump, not bottomed yet.
+      2. Once the low stops falling, require it to HOLD for a number of
+         polls scaled to the dump's speed (see required_bottom_dwell_polls).
+      3. Once bottomed, require the bounce to reclaim a real fraction of
+         the drop back toward the old peak (not just any uptick off the
+         low), AND require 5m volume to be rising versus the moment it
+         bottomed, AND require a healthy share of that volume to actually
+         be buys, not sells.
+      4. Require that combination to hold for a couple of consecutive
+         polls before firing, so one noisy tick can't trigger it.
+    """
     if not ENABLE_DIP_REENTRY_ALERTS:
         return False
 
@@ -1319,27 +1404,78 @@ def detect_dip_reentry(token_address: str, current_price: float, vol_spike: bool
     if not peak:
         return False
 
-    # Track the lowest price seen since the peak. As long as price keeps
-    # falling, we're still "finding the bottom" — not a re-entry yet.
+    # Step 1: still finding the bottom? Track the lowest price seen since
+    # the peak, and reset the dwell/confirmation counters every time a new
+    # low appears — a new low means the previous "bottom" wasn't one.
     low_since_peak = state.get("price_low_since_peak")
     if low_since_peak is None or current_price < low_since_peak:
-        state["price_low_since_peak"] = current_price
+        state["price_low_since_peak"]    = current_price
+        state["price_low_set_at"]        = time.time()
+        state["no_new_low_count"]        = 0
+        state["dump_baseline_vol5m"]     = None
+        state["dump_baseline_buy_ratio"] = None
+        state["recovery_confirm_count"]  = 0
         return False
 
-    if low_since_peak <= 0 or current_price <= low_since_peak:
-        return False  # no dip happened yet, or hasn't started bouncing
+    if low_since_peak <= 0:
+        return False
 
-    bounce_off_low_pct = (current_price - low_since_peak) / low_since_peak * 100
+    state["no_new_low_count"] = state.get("no_new_low_count", 0) + 1
 
-    min_bounce = (
-        DIP_REENTRY_MIN_BOUNCE_STRONG_LORE
+    # Step 2: has the low held long enough to call it a bottom, given how
+    # fast this particular dump happened?
+    peak_set_at = state.get("price_high_set_at") or state.get("first_seen", time.time())
+    low_set_at  = state.get("price_low_set_at")  or peak_set_at
+    dump_minutes = (low_set_at - peak_set_at) / 60
+    drop_pct = (peak - low_since_peak) / peak * 100
+
+    required_polls = required_bottom_dwell_polls(drop_pct, dump_minutes)
+    if state["no_new_low_count"] < required_polls:
+        return False  # low hasn't held long enough yet — could still be a
+                       # pause mid-dump, not a real bottom
+
+    # Step 3: bottom confirmed. Capture the volume/buy-pressure baseline
+    # the FIRST poll we get here (not overwritten on later polls), so
+    # "rising" is measured against the moment it actually bottomed.
+    buys_5m  = pair.get("txns", {}).get("m5", {}).get("buys", 0) or 0
+    sells_5m = pair.get("txns", {}).get("m5", {}).get("sells", 0) or 0
+    txns_5m  = buys_5m + sells_5m
+    vol5m_now = pair.get("volume", {}).get("m5", 0) or 0
+    buy_ratio_now = (buys_5m / txns_5m) if txns_5m > 0 else 0.0
+
+    if state.get("dump_baseline_vol5m") is None:
+        state["dump_baseline_vol5m"]     = vol5m_now
+        state["dump_baseline_buy_ratio"] = buy_ratio_now
+
+    baseline_vol5m = state.get("dump_baseline_vol5m") or 0
+
+    recovery_ratio = recovery_ratio_since_low(peak, low_since_peak, current_price)
+    min_recovery = (
+        DIP_REENTRY_MIN_RECOVERY_STRONG_LORE
         if state.get("had_trending_lore")
-        else DIP_REENTRY_MIN_BOUNCE_WEAK_LORE
+        else DIP_REENTRY_MIN_RECOVERY_WEAK_LORE
     )
-    if bounce_off_low_pct < min_bounce:
-        return False
 
-    if not vol_spike:
+    volume_rising = (
+        baseline_vol5m > 0
+        and vol5m_now >= baseline_vol5m * DIP_REENTRY_MIN_VOLUME_RISE_RATIO
+    )
+    buy_pressure_ok = txns_5m > 0 and buy_ratio_now >= DIP_REENTRY_MIN_BUY_RATIO
+
+    meets_bar = (
+        recovery_ratio >= min_recovery
+        and volume_rising
+        and buy_pressure_ok
+    )
+
+    # Step 4: needs to hold for a couple of consecutive polls, not just
+    # one noisy tick.
+    if meets_bar:
+        state["recovery_confirm_count"] = state.get("recovery_confirm_count", 0) + 1
+    else:
+        state["recovery_confirm_count"] = 0
+
+    if state["recovery_confirm_count"] < DIP_REENTRY_CONFIRM_POLLS:
         return False
 
     state["alerted_reentry"] = True
@@ -1537,7 +1673,12 @@ def format_dip_reentry_alert(pair: dict, state: dict, current_price: float, curr
     initial_mcap = state.get("initial_mcap", 0)
     drop_pct     = (peak - low) / peak * 100 if peak else 0
     bounce_pct   = (current_price - low) / low * 100 if low else 0
+    recovery_pct = recovery_ratio_since_low(peak, low, current_price) * 100
     vol5m        = pair.get("volume", {}).get("m5", 0) or 0
+    buys_5m      = pair.get("txns", {}).get("m5", {}).get("buys", 0) or 0
+    sells_5m     = pair.get("txns", {}).get("m5", {}).get("sells", 0) or 0
+    txns_5m      = buys_5m + sells_5m
+    buy_pct      = (buys_5m / txns_5m * 100) if txns_5m > 0 else 0
     lore_tier    = "🔥 strong lore — easier bar" if state.get("had_trending_lore") else "🟡 no lore signal — needed a bigger bounce"
 
     return (
@@ -1545,8 +1686,10 @@ def format_dip_reentry_alert(pair: dict, state: dict, current_price: float, curr
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"*{base.get('name','?')}* `{base.get('symbol','?')}`\n"
         f"📋 `{addr}`\n\n"
-        f"Pumped, dipped *{drop_pct:.0f}%* from peak, now bouncing "
-        f"*+{bounce_pct:.0f}%* off the low — with fresh volume coming in.\n"
+        f"Pumped, dipped *{drop_pct:.0f}%* from peak, bottomed out, and "
+        f"bounced *+{bounce_pct:.0f}%* off the low — that's *{recovery_pct:.0f}%* "
+        f"of the way back to peak, with real buying behind it.\n"
+        f"Buy pressure (5m): *{buy_pct:.0f}%* buys ({buys_5m}B/{sells_5m}S)\n"
         f"Lore: {lore_tier}\n\n"
         f"📊 Market Cap: `${initial_mcap:,.0f}` (start) → `${current_mcap:,.0f}` (now)\n"
         f"💲 Price: peak `${peak:.8f}` → low `${low:.8f}` → now `${current_price:.8f}`\n"
@@ -1756,7 +1899,13 @@ async def process_new_token(
         "first_seen":          time.time(),
         "initial_price":       price_now,
         "price_high":          price_now,
+        "price_high_set_at":   time.time(),
         "price_low_since_peak": None,
+        "price_low_set_at":    None,
+        "no_new_low_count":    0,
+        "dump_baseline_vol5m":     None,
+        "dump_baseline_buy_ratio": None,
+        "recovery_confirm_count":  0,
         "alerted_reentry":     False,
         "initial_liquidity":   liq_now,   # NEW: real value captured immediately,
                                            # this path has it on hand already
@@ -1926,9 +2075,21 @@ async def run_bot():
                         # Peak tracking now runs unconditionally (not gated
                         # behind ENABLE_DIP_ALERTS) so dip re-entry detection
                         # keeps working even if you turn plain dip alerts off.
+                        # NEW: a fresh peak also resets the dip-tracking
+                        # state below it — an old low from a previous dip
+                        # cycle is meaningless once price has made a new
+                        # high, and the dump-speed calc needs a clean
+                        # peak→low pair to be accurate.
                         if price_now > state.get("price_high", 0):
                             state["price_high"] = price_now
+                            state["price_high_set_at"] = time.time()
                             state["alerted_dips"] = set()
+                            state["price_low_since_peak"] = None
+                            state["price_low_set_at"] = None
+                            state["no_new_low_count"] = 0
+                            state["dump_baseline_vol5m"] = None
+                            state["dump_baseline_buy_ratio"] = None
+                            state["recovery_confirm_count"] = 0
 
                         dip       = detect_dip(token_address, price_now) if ENABLE_DIP_ALERTS else None
                         vol_spike = detect_volume_spike(pair)
@@ -1962,7 +2123,7 @@ async def run_bot():
 
                         # NEW: dip re-entry alert — pumped, dipped, now
                         # bouncing back with fresh volume
-                        if detect_dip_reentry(token_address, price_now, vol_spike):
+                        if detect_dip_reentry(token_address, price_now, pair):
                             sym = pair.get("baseToken", {}).get("symbol", "?")
                             log.info(f"🔁 Dip re-entry: {sym} ({token_address[:8]}...)")
                             await bot.send_message(
