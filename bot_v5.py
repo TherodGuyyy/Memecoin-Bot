@@ -25,6 +25,7 @@ import asyncio
 import os
 import re
 import time
+import difflib
 import logging
 from typing import Optional
 import aiohttp
@@ -188,6 +189,32 @@ MIN_LORE_SCORE              = 1      # 0 = no socials at all → reject
 # when they actually have a clear, specific story attached to them.
 MIN_DESCRIPTION_LENGTH = 40   # characters — filters out empty/junk descriptions
 
+# ── Duplicate/templated description detection (NEW) ─────────────────────────
+# Rug factories very often reuse the same description template across many
+# throwaway tokens, just swapping the coin name. A description that's a
+# near-match to one we've seen recently — even with the name changed — is a
+# real, concrete rug-factory signal, independent of anything Rugcheck itself
+# reports. Compares against a rolling in-memory history (bounded by both a
+# time window and a max size, so it doesn't grow forever or slow down over
+# a long-running deploy). Only applies to tokens with description text at
+# all (GMGN-sourced tokens don't carry a description field, so this only
+# affects the DEXScreener+Rugcheck path).
+REJECT_DUPLICATE_DESCRIPTION       = True
+DESCRIPTION_DEDUP_MIN_LENGTH       = 30    # don't bother comparing anything
+                                            # shorter than this — too little
+                                            # text for a similarity score to
+                                            # mean anything
+DESCRIPTION_SIMILARITY_THRESHOLD   = 0.85  # 0-1 scale (difflib ratio) — how
+                                            # close counts as "the same
+                                            # template with the name swapped"
+DESCRIPTION_DEDUP_WINDOW_HOURS     = 48    # how far back to keep comparing
+                                            # against — rug factories often
+                                            # cycle the same template over
+                                            # days, not just minutes
+DESCRIPTION_DEDUP_MAX_HISTORY      = 500   # hard cap regardless of age, so
+                                            # a very high-volume stretch
+                                            # can't blow up memory/CPU
+
 # ── Trending lore matching (NEW) ──────────────────────────────────────────────
 # Two sources feed the trending keyword list:
 #  1. MANUAL: trending_lore.txt — you edit this yourself, any time, no restart
@@ -261,18 +288,21 @@ ENABLE_DIP_REENTRY_ALERTS      = True
 
 # ── Step 1: how long the low must hold before it counts as "bottomed" ───────
 # Scaled to how violent the dump was (measured in % dropped per minute).
-# A fast flush proves itself in ~1-2 min; a slow grind needs longer, since
-# a brief pause mid-bleed can look identical to a real bottom over a
-# single poll.
-DIP_REENTRY_LOW_TOLERANCE_PCT              = 3.0   # a wick up to 3% below
+# A fast flush proves itself in under a minute; even a slow grind doesn't
+# need to hold much longer than that — loosened from the original 1.5-4 min
+# range after real data showed it was catching almost nothing: 3 dip
+# re-entry alerts out of 500 caught tokens, despite 250+ of those hitting
+# 2x on their own. The bar was too strict to catch dips that were actually
+# recovering.
+DIP_REENTRY_LOW_TOLERANCE_PCT              = 7.0   # a wick up to 7% below
                                                      # the tracked low still
                                                      # counts as "holding,"
                                                      # not a fresh leg down
 DIP_REENTRY_FAST_DUMP_RATE_PCT_PER_MIN     = 15
 DIP_REENTRY_MODERATE_DUMP_RATE_PCT_PER_MIN = 5
-DIP_REENTRY_BOTTOM_DWELL_FAST_MIN     = 1.5   # dump_rate > 15%/min
-DIP_REENTRY_BOTTOM_DWELL_MODERATE_MIN = 2.5   # dump_rate > 5%/min
-DIP_REENTRY_BOTTOM_DWELL_SLOW_MIN     = 4.0   # dump_rate <= 5%/min
+DIP_REENTRY_BOTTOM_DWELL_FAST_MIN     = 0.5   # dump_rate > 15%/min (1 poll)
+DIP_REENTRY_BOTTOM_DWELL_MODERATE_MIN = 1.0   # dump_rate > 5%/min (2 polls)
+DIP_REENTRY_BOTTOM_DWELL_SLOW_MIN     = 1.5   # dump_rate <= 5%/min (3 polls)
 
 # ── Step 2: how much of the drop must be recovered once bottomed ───────────
 # Fraction of the peak-to-low drop that must be reclaimed — 1.0 means back
@@ -1242,6 +1272,58 @@ def passes_lore_filters(sec: dict) -> tuple[bool, str]:
     return False, "No socials AND no real description found — no lore, no send"
 
 
+# ── Duplicate/templated description detection ───────────────────────────────
+# Rolling history of recently-seen descriptions, so a new token's description
+# can be compared against ones caught earlier — even after a redeploy wipes
+# this (in-memory only, same as everything else tracked), it just starts
+# rebuilding from a clean slate rather than breaking anything.
+_recent_descriptions: list = []   # [{"text": str, "seen_at": float, "symbol": str}, ...]
+
+
+def _normalize_description(desc: str) -> str:
+    """Lowercase, collapse whitespace, strip — so two descriptions that
+    differ only in casing/spacing/punctuation still compare as identical."""
+    text = (desc or "").lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def check_duplicate_description(description: str, symbol: str) -> tuple[bool, str]:
+    """Returns (is_duplicate, match_info). Compares the given description
+    against a rolling window of recently-seen ones using difflib's
+    similarity ratio — catches a rug-factory template with just the coin
+    name swapped, not only byte-for-byte identical text.
+
+    Always records the description into history (even if this call itself
+    doesn't flag a duplicate) so a LATER copy of the same template gets
+    caught, even though the very first instance of a new template can't be
+    — there's nothing to compare it against yet."""
+    now = time.time()
+
+    # prune anything outside the window, and hard-cap the size regardless
+    cutoff = now - (DESCRIPTION_DEDUP_WINDOW_HOURS * 3600)
+    while _recent_descriptions and _recent_descriptions[0]["seen_at"] < cutoff:
+        _recent_descriptions.pop(0)
+    while len(_recent_descriptions) > DESCRIPTION_DEDUP_MAX_HISTORY:
+        _recent_descriptions.pop(0)
+
+    normalized = _normalize_description(description)
+    if len(normalized) < DESCRIPTION_DEDUP_MIN_LENGTH:
+        return False, ""  # too short to meaningfully compare either way
+
+    is_duplicate = False
+    match_info = ""
+    for entry in _recent_descriptions:
+        ratio = difflib.SequenceMatcher(None, normalized, entry["text"]).ratio()
+        if ratio >= DESCRIPTION_SIMILARITY_THRESHOLD:
+            is_duplicate = True
+            match_info = f"{ratio:.0%} match to {entry['symbol']}"
+            break
+
+    _recent_descriptions.append({"text": normalized, "seen_at": now, "symbol": symbol})
+    return is_duplicate, match_info
+
+
 def build_lore_summary(sec: dict) -> str:
     """
     Builds a compact lore panel for the alert message.
@@ -1894,6 +1976,18 @@ async def process_new_token(
     if not lore_ok:
         log.info(f"Lore fail [{token_address[:8]}]: {lore_reason}")
         return
+
+    # Step 5b: Duplicate/templated description check — catches rug-factory
+    # templates (same blurb, name swapped) even when everything else about
+    # the token looks clean
+    if REJECT_DUPLICATE_DESCRIPTION:
+        symbol_for_dedup = pair.get("baseToken", {}).get("symbol", "?")
+        is_dup, dup_info = check_duplicate_description(
+            sec.get("description", ""), symbol_for_dedup
+        )
+        if is_dup:
+            log.info(f"Duplicate description fail [{token_address[:8]}]: {dup_info}")
+            return
 
     # Step 6: Trending lore check (informational, or hard filter if
     # TRENDING_LORE_ONLY is True)

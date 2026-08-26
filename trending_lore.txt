@@ -9,11 +9,49 @@
 # It checks each new token's NAME, SYMBOL, DESCRIPTION, and X/Twitter
 # handle for these words (loose substring match, so "robinhood" also
 # catches "ROBINHOODCOIN", "$ROBINHOOD", etc.)
-#
-# Update this whenever you spot a narrative popping off — e.g. today
-# it might be:
+
+# ── existing ──
 ansem
 robinhood
+
+# ── AI-agent meta (one of three dominant 2026 narratives per current
+# coverage, alongside PolitiFi and NFT/community tokens) ──
+ai agent
+agentfun
+pippin
+truth terminal
+goatseus
+ai16z
+
+# ── PolitiFi — political/policy-tied tokens, currently sensitive to
+# real news catalysts (crypto policy proposals move this category) ──
+politifi
+clarity act
+
+# ── viral-animal narratives — recurring, reliable category; each new
+# viral animal video tends to spawn a fast copycat wave ──
+moo deng
+moodeng
+pnut
+popcat
+gigachad
+
+# ── cat-meme rotation — capital rotating from dog-coins into cat-coins
+# is an explicitly named recurring pattern right now ──
+catecoin
+catcoin
+# NOTE: deliberately NOT adding bare "cat" — it's only 3 characters and
+# would substring-match "category", "delicate", "vacate", etc. Same
+# caution applies to any other short/common word you're tempted to add.
+
+# ── "brainrot" meta — named as one of the strongest 2025-2026 token
+# families (Italian brainrot / Skibidi-adjacent absurdist characters) ──
+brainrot
+skibidi
+
+# ── community-culture branding phrase seen recurring on entertainment-
+# only tokens (e.g. Fartcoin's self-description) ──
+no cabal
 
 # Add more below as you spot them, e.g.:
 # ansem's dog
