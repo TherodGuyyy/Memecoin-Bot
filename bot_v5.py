@@ -52,7 +52,18 @@ async def send_with_retry(bot, chat_id, text, parse_mode=None, disable_web_page_
     hit 2x/3x later and alert fine on THAT. From the outside that looks
     exactly like "a token appeared out of nowhere already 2x'd, I never
     saw the launch." A couple of quick retries make that failure mode rare
-    without changing anything about what gets tracked or alerted."""
+    without changing anything about what gets tracked or alerted.
+
+    REVISED: a plain retry doesn't help a specific, common failure —
+    Telegram's Markdown parser rejecting the whole message because a
+    token's on-chain name/symbol/description (fully attacker-controlled,
+    can contain anything) has an unescaped/unbalanced *, _, `, or [. That
+    isn't transient — the same broken text fails identically on every
+    retry, silently losing the alert every time while the token still
+    gets tracked and can alert fine later on a 2x that doesn't touch the
+    same broken text. Now falls back to plain text (no formatting) once
+    on that specific failure, so the alert always lands even when a
+    token's name breaks the parser."""
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -65,6 +76,26 @@ async def send_with_retry(bot, chat_id, text, parse_mode=None, disable_web_page_
             return True
         except Exception as e:
             last_exc = e
+            err_str = str(e).lower()
+            is_parse_error = parse_mode and (
+                "can't parse entities" in err_str or "can't find end" in err_str
+            )
+            if is_parse_error:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode=None,   # plain text — guaranteed to send
+                        disable_web_page_preview=disable_web_page_preview,
+                    )
+                    log.warning(
+                        "send_with_retry: Markdown parse failed (likely a "
+                        "special character in the token name/description) "
+                        "— sent as plain text instead"
+                    )
+                    return True
+                except Exception as e2:
+                    last_exc = e2
             if attempt < max_attempts:
                 await asyncio.sleep(1.5 * attempt)  # short, increasing backoff
     log.error(f"send_with_retry: giving up after {max_attempts} attempts — {last_exc}")
