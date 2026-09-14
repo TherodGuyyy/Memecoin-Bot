@@ -25,7 +25,6 @@ import asyncio
 import os
 import re
 import time
-import difflib
 import logging
 from typing import Optional
 import aiohttp
@@ -39,6 +38,37 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger(__name__)
+
+# ─── UTILITIES ───────────────────────────────────────────────────────────────
+
+async def send_with_retry(bot, chat_id, text, parse_mode=None, disable_web_page_preview=None,
+                           max_attempts: int = 3):
+    """Send a Telegram message with a couple of retries on failure.
+
+    Fixes a real (pre-existing) gap: a token gets added to tracked_tokens
+    BEFORE its launch alert is sent, so if that one send call hits a
+    transient Telegram/network hiccup and throws, the token stays tracked
+    silently — no launch alert ever went out, but it can still go on to
+    hit 2x/3x later and alert fine on THAT. From the outside that looks
+    exactly like "a token appeared out of nowhere already 2x'd, I never
+    saw the launch." A couple of quick retries make that failure mode rare
+    without changing anything about what gets tracked or alerted."""
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+            return True
+        except Exception as e:
+            last_exc = e
+            if attempt < max_attempts:
+                await asyncio.sleep(1.5 * attempt)  # short, increasing backoff
+    log.error(f"send_with_retry: giving up after {max_attempts} attempts — {last_exc}")
+    return False
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -202,11 +232,27 @@ MIN_DESCRIPTION_LENGTH = 40   # characters — filters out empty/junk descriptio
 REJECT_DUPLICATE_DESCRIPTION       = True
 DESCRIPTION_DEDUP_MIN_LENGTH       = 30    # don't bother comparing anything
                                             # shorter than this — too little
-                                            # text for a similarity score to
-                                            # mean anything
-DESCRIPTION_SIMILARITY_THRESHOLD   = 0.85  # 0-1 scale (difflib ratio) — how
-                                            # close counts as "the same
-                                            # template with the name swapped"
+                                            # text to mean anything either way
+DESCRIPTION_DEDUP_MIN_CONTENT_WORDS = 4    # after stripping common filler
+                                            # words, need at least this many
+                                            # real content words left to
+                                            # compare meaningfully
+DESCRIPTION_SIMILARITY_THRESHOLD   = 0.6   # 0-1 scale — Jaccard overlap of
+                                            # CONTENT words (filler stripped
+                                            # first), not raw text similarity.
+                                            # REVISED: the original version
+                                            # compared raw character
+                                            # sequences and badly
+                                            # over-triggered — unrelated
+                                            # tokens sharing generic
+                                            # pump.fun phrasing ("the first
+                                            # token to bring ___ to the
+                                            # moon...") scored 93-98%
+                                            # similar despite being about
+                                            # completely different things.
+                                            # This threshold is tuned for
+                                            # the new content-word-overlap
+                                            # method instead.
 DESCRIPTION_DEDUP_WINDOW_HOURS     = 48    # how far back to keep comparing
                                             # against — rug factories often
                                             # cycle the same template over
@@ -905,7 +951,8 @@ async def process_new_gmgn_token(bot: Bot, token: dict) -> None:
     global _total_tokens_caught
     _total_tokens_caught += 1
 
-    await bot.send_message(
+    await send_with_retry(
+        bot,
         chat_id=TELEGRAM_CHAT_ID,
         text=format_gmgn_launch_alert(token, meta_info),
         parse_mode=ParseMode.MARKDOWN,
@@ -1277,50 +1324,79 @@ def passes_lore_filters(sec: dict) -> tuple[bool, str]:
 # can be compared against ones caught earlier — even after a redeploy wipes
 # this (in-memory only, same as everything else tracked), it just starts
 # rebuilding from a clean slate rather than breaking anything.
-_recent_descriptions: list = []   # [{"text": str, "seen_at": float, "symbol": str}, ...]
+#
+# REVISED: the first version of this compared raw character sequences
+# (difflib), which turned out to over-trigger badly — two totally
+# different, unrelated tokens sharing common pump.fun boilerplate phrasing
+# ("the first token to bring ___ to the moon, join the movement today")
+# scored 93-98% similar despite being about completely different things,
+# just because the shared filler dominates a short string. That was
+# silently rejecting a large chunk of genuinely fine DEXScreener-path
+# tokens. Fixed by stripping common filler words first and comparing what
+# CONTENT words are left — "dogs" vs "cats" now correctly scores as
+# unrelated (33% overlap) instead of near-identical.
+_recent_descriptions: list = []   # [{"words": frozenset, "seen_at": float, "symbol": str}, ...]
+
+_DESCRIPTION_FILLER_WORDS = {
+    "the", "a", "an", "to", "for", "of", "in", "on", "is", "it", "its", "this",
+    "that", "and", "or", "with", "at", "here", "all", "no", "not", "just",
+    "token", "coin", "crypto", "memecoin", "meme", "community", "driven",
+    "first", "join", "movement", "today", "now", "made", "people", "culture",
+    "moon", "mooning", "random", "fun", "nothing", "serious", "about", "will",
+    "be", "are", "was", "were", "have", "has", "we", "our", "you", "your",
+}
 
 
-def _normalize_description(desc: str) -> str:
-    """Lowercase, collapse whitespace, strip — so two descriptions that
-    differ only in casing/spacing/punctuation still compare as identical."""
-    text = (desc or "").lower().strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
+def _content_words(text: str) -> frozenset:
+    """Lowercase, strip common filler/boilerplate words, return what's left
+    as a set. Two descriptions are compared on this — not raw text — so
+    shared scaffolding phrasing doesn't get mistaken for a real duplicate."""
+    text = (text or "").lower()
+    words = re.findall(r"[a-z0-9']+", text)
+    return frozenset(w for w in words if w not in _DESCRIPTION_FILLER_WORDS and len(w) > 2)
 
 
 def check_duplicate_description(description: str, symbol: str) -> tuple[bool, str]:
-    """Returns (is_duplicate, match_info). Compares the given description
-    against a rolling window of recently-seen ones using difflib's
-    similarity ratio — catches a rug-factory template with just the coin
-    name swapped, not only byte-for-byte identical text.
+    """Returns (is_duplicate, match_info). Compares the CONTENT words left
+    after stripping common filler against a rolling window of recently-seen
+    ones, using Jaccard similarity (overlap / union of the two word sets) —
+    catches a rug-factory template with just the coin name/theme swapped,
+    without flagging unrelated tokens that just happen to share generic
+    pump.fun phrasing.
 
-    Always records the description into history (even if this call itself
-    doesn't flag a duplicate) so a LATER copy of the same template gets
-    caught, even though the very first instance of a new template can't be
-    — there's nothing to compare it against yet."""
+    Always records into history (even if this call itself isn't flagged as
+    a duplicate) so a LATER copy of the same template gets caught — the
+    very first instance of a new template can't be, since there's nothing
+    to compare it against yet."""
     now = time.time()
 
-    # prune anything outside the window, and hard-cap the size regardless
     cutoff = now - (DESCRIPTION_DEDUP_WINDOW_HOURS * 3600)
     while _recent_descriptions and _recent_descriptions[0]["seen_at"] < cutoff:
         _recent_descriptions.pop(0)
     while len(_recent_descriptions) > DESCRIPTION_DEDUP_MAX_HISTORY:
         _recent_descriptions.pop(0)
 
-    normalized = _normalize_description(description)
-    if len(normalized) < DESCRIPTION_DEDUP_MIN_LENGTH:
-        return False, ""  # too short to meaningfully compare either way
+    if len(description or "") < DESCRIPTION_DEDUP_MIN_LENGTH:
+        return False, ""  # too short to bother with at all
+
+    words = _content_words(description)
+    if len(words) < DESCRIPTION_DEDUP_MIN_CONTENT_WORDS:
+        return False, ""  # almost nothing left after stripping filler —
+                           # not enough real content to compare meaningfully
 
     is_duplicate = False
     match_info = ""
     for entry in _recent_descriptions:
-        ratio = difflib.SequenceMatcher(None, normalized, entry["text"]).ratio()
-        if ratio >= DESCRIPTION_SIMILARITY_THRESHOLD:
+        union = words | entry["words"]
+        if not union:
+            continue
+        jaccard = len(words & entry["words"]) / len(union)
+        if jaccard >= DESCRIPTION_SIMILARITY_THRESHOLD:
             is_duplicate = True
-            match_info = f"{ratio:.0%} match to {entry['symbol']}"
+            match_info = f"{jaccard:.0%} content-word overlap with {entry['symbol']}"
             break
 
-    _recent_descriptions.append({"text": normalized, "seen_at": now, "symbol": symbol})
+    _recent_descriptions.append({"words": words, "seen_at": now, "symbol": symbol})
     return is_duplicate, match_info
 
 
@@ -2049,7 +2125,8 @@ async def process_new_token(
     global _total_tokens_caught
     _total_tokens_caught += 1
 
-    await bot.send_message(
+    await send_with_retry(
+        bot,
         chat_id=TELEGRAM_CHAT_ID,
         text=format_launch_alert(pair, sec, trend, meta_info),
         parse_mode=ParseMode.MARKDOWN,
