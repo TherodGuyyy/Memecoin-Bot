@@ -480,7 +480,13 @@ async def fetch_token_pairs(session: aiohttp.ClientSession, token_address: str) 
             if r.status != 200:
                 return []
             data = await r.json()
-            return [p for p in data.get("pairs", []) if p.get("chainId") == "solana"]
+            # NOTE: DEXScreener returns {"pairs": null} (not a missing key)
+            # for a token it hasn't indexed yet — .get("pairs", []) only
+            # falls back to [] when the KEY is missing, not when it's
+            # present but explicitly null, so that case was hitting the
+            # except below and logging as an error every time, even though
+            # "not indexed yet" is a normal, expected state, not a failure.
+            return [p for p in (data.get("pairs") or []) if p.get("chainId") == "solana"]
     except (Exception, asyncio.CancelledError, asyncio.TimeoutError) as e:
         log.error(f"DEXScreener pairs error: {e}")
         return []
