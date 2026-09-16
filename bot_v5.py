@@ -459,6 +459,44 @@ CREATOR_MIN_BOND_RATIO_LENIENT   = 0.30  # between floor and this = only
 tracked_tokens: dict = {}
 _last_hourly_report: float = 0.0
 
+# NEW: negative cache — tokens that were checked and FAILED a filter get
+# remembered here (address -> time they were rejected), so the main loop
+# stops re-fetching and re-evaluating the exact same dead token on every
+# single cycle forever. Without this, a token sitting in DEXScreener's
+# latest-profiles/boosts list gets logged as "DEX fail" over and over,
+# aging up each cycle, with zero chance of ever passing (e.g. once a
+# token is already past MAX_TOKEN_AGE_MINS, it will ONLY get older).
+REJECTED_TOKENS: dict = {}
+REJECTED_TOKEN_TTL_HOURS = 24   # how long we remember a rejection before
+                                 # letting the token be re-checked again —
+                                 # long enough to stop the repeat-fail spam
+                                 # seen in practice (some tokens lingered in
+                                 # the source feed for days), short enough
+                                 # that a genuine data hiccup (e.g. a
+                                 # temporary "no liquidity yet" read) isn't
+                                 # a life sentence.
+
+def is_rejected(token_address: str) -> bool:
+    ts = REJECTED_TOKENS.get(token_address)
+    if ts is None:
+        return False
+    if time.time() - ts > REJECTED_TOKEN_TTL_HOURS * 3600:
+        # expired — let it be re-checked
+        del REJECTED_TOKENS[token_address]
+        return False
+    return True
+
+def mark_rejected(token_address: str) -> None:
+    REJECTED_TOKENS[token_address] = time.time()
+
+def prune_rejected_tokens() -> None:
+    """Sweep expired entries out of REJECTED_TOKENS so it doesn't grow
+    forever. Cheap dict scan — call once per main loop cycle."""
+    cutoff = time.time() - (REJECTED_TOKEN_TTL_HOURS * 3600)
+    expired = [addr for addr, ts in REJECTED_TOKENS.items() if ts < cutoff]
+    for addr in expired:
+        del REJECTED_TOKENS[addr]
+
 # NEW: persistent, all-time records — these never get cleared or pruned
 # (unlike tracked_tokens, which drops tokens after 6 hours). This is what
 # actually fixes the hourly report only showing a live snapshot: these two
@@ -467,21 +505,28 @@ _last_hourly_report: float = 0.0
 _total_tokens_caught: int = 0        # every launch alert ever sent this run
 _all_time_2x_log: list    = []       # every 2x+ milestone ever hit this run
 
-# ── Hourly performance report (NEW) ───────────────────────────────────────────
+# ── Hourly report — NOW lean: only tokens that have doubled (CHANGED) ─────────
+# Previously fired every hour with BOTH the lifetime totals/all-time list AND
+# the current-hour movers, using a 20%-gain bar. Now it's just "what's 2x+
+# right now" — the lifetime totals moved to their own 24h report below, and
+# the "biggest runners" list moved to its own 6h report below, so the same
+# big numbers aren't repeated 24 times a day.
 HOURLY_REPORT_INTERVAL_SEC  = 3600  # send every 60 minutes
-HOURLY_REPORT_MIN_GAIN_PCT  = 20    # only list tokens up at least this % from
-                                     # their launch-alert price — "done well,"
-                                     # not just "still exists"
+HOURLY_REPORT_MIN_GAIN_PCT  = 100   # 100% gain = 2x — "doubled," not just "up"
 HOURLY_REPORT_MAX_LISTED    = 15    # cap the list so it doesn't get unwieldy
 
-# ── 24-hour top performers report (NEW) ───────────────────────────────────────
+# ── 6-hour "biggest runners" report (CHANGED — was a 24h report) ─────────────
 # Built entirely from _all_time_2x_log below (already timestamped), so this
 # doesn't depend on tracked_tokens at all — meaning it's unaffected by the
-# 6-hour tracked-tokens cleanup elsewhere in the loop. Purely additive: only
-# reads _all_time_2x_log, never modifies it, so the existing hourly report's
-# own "all-time since bot started" section keeps working exactly as before.
-DAILY_REPORT_INTERVAL_SEC = 24 * 3600   # send every 24 hours
-DAILY_REPORT_MAX_LISTED   = 15          # cap the list, same idea as hourly
+# 6-hour tracked-tokens cleanup elsewhere in the loop. Read-only: only reads
+# _all_time_2x_log, never modifies it.
+SIX_HOUR_REPORT_INTERVAL_SEC = 6 * 3600   # send every 6 hours
+RUNNERS_REPORT_MAX_LISTED    = 15         # cap the list, same idea as hourly
+_last_six_hour_report: float = 0.0
+
+# ── 24-hour all-time summary report (CHANGED — this content used to be
+# baked into EVERY hourly report; now it fires once a day instead) ──────────
+ALLTIME_REPORT_INTERVAL_SEC = 24 * 3600   # send every 24 hours
 _last_24h_report: float = 0.0
 _trending_cache: dict = {
     "coingecko": set(), "coingecko_fetched_at": 0.0,
@@ -502,6 +547,31 @@ async def fetch_new_solana_profiles(session: aiohttp.ClientSession) -> list:
             return [t for t in data if t.get("chainId") == "solana"]
     except (Exception, asyncio.CancelledError, asyncio.TimeoutError) as e:
         log.error(f"DEXScreener profiles error: {e}")
+        return []
+
+# NEW: second DEXScreener discovery source. token-profiles/latest/v1 only
+# lists tokens whose PROFILE (description/socials/image) was submitted or
+# updated — a slow-moving, opt-in list that most brand-new pump.fun-style
+# launches never touch in their first hour. token-boosts/latest/v1 is a
+# separate, independently-updating DEXScreener feed (tokens that just got a
+# paid "boost") with the same response shape, so it's a free way to widen
+# the discovery pool without abandoning DEXScreener as a launch source.
+#
+# HONEST LIMITATION: both feeds require the project to opt in (submit a
+# profile, or buy a boost) — neither is a raw "every new pair on-chain"
+# firehose, since DEXScreener's free public API doesn't expose one. This
+# widens the net but won't catch a launch that does neither. GMGN's
+# new_creation trench remains the closest thing to a true raw feed.
+async def fetch_boosted_solana_tokens(session: aiohttp.ClientSession) -> list:
+    url = f"{DEXSCREENER_BASE}/token-boosts/latest/v1"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return []
+            data = await r.json()
+            return [t for t in data if t.get("chainId") == "solana"]
+    except (Exception, asyncio.CancelledError, asyncio.TimeoutError) as e:
+        log.error(f"DEXScreener boosts error: {e}")
         return []
 
 async def fetch_token_pairs(session: aiohttp.ClientSession, token_address: str) -> list:
@@ -1923,75 +1993,51 @@ def format_hourly_report(snapshot: list) -> str:
     """snapshot is a list of dicts: {symbol, gain_pct, mcap, url, address}
     collected during THIS hour's tracked-tokens scan (current-moment view).
 
-    NEW: this now also pulls from the permanent, never-cleared records
-    (_total_tokens_caught, _all_time_2x_log) so the report shows the full
-    picture — everything ever caught, everything that ever hit 2x+, not
-    just whatever's currently sitting above the bar at the exact moment
-    the report happens to run."""
-    this_hour_winners = [s for s in snapshot if s["gain_pct"] >= HOURLY_REPORT_MIN_GAIN_PCT]
-    this_hour_winners.sort(key=lambda s: s["gain_pct"], reverse=True)
-    this_hour_winners = this_hour_winners[:HOURLY_REPORT_MAX_LISTED]
+    CHANGED: this report is now ONLY the tokens that have doubled (2x+,
+    HOURLY_REPORT_MIN_GAIN_PCT=100) since their launch alert and are
+    STILL currently tracked. The lifetime totals + all-time achievers
+    list that used to live here every single hour now fire once a day
+    instead — see format_alltime_summary_report."""
+    winners = [s for s in snapshot if s["gain_pct"] >= HOURLY_REPORT_MIN_GAIN_PCT]
+    winners.sort(key=lambda s: s["gain_pct"], reverse=True)
+    winners = winners[:HOURLY_REPORT_MAX_LISTED]
 
     header = (
-        f"📊 *HOURLY REPORT*\n"
+        f"📊 *HOURLY REPORT — CURRENT 2x+ MOVERS*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Total caught since bot started: `{_total_tokens_caught}`\n"
-        f"🚀 Total 2x+ hits since bot started: `{len(_all_time_2x_log)}`\n"
-        f"👀 Currently tracking: `{len(snapshot)}` tokens\n\n"
     )
 
-    # ── All-time 2x+ log ──────────────────────────────────────────────────
-    alltime_section = "🏆 *ALL-TIME 2x+ ACHIEVERS*\n"
-    if not _all_time_2x_log:
-        alltime_section += "None yet.\n"
-    else:
-        # Show the best hit per token (not every single milestone it passed
-        # through), most recent/highest first, capped so it stays readable
-        best_per_token = {}
-        for entry in _all_time_2x_log:
-            addr = entry["address"]
-            if addr not in best_per_token or entry["threshold"] > best_per_token[addr]["threshold"]:
-                best_per_token[addr] = entry
-        ranked = sorted(best_per_token.values(), key=lambda e: e["threshold"], reverse=True)
-        for i, e in enumerate(ranked[:HOURLY_REPORT_MAX_LISTED], 1):
-            alltime_section += f"{i}. *{e['symbol']}* — `{e['threshold']:g}x` (mcap ${e['mcap']:,.0f}) [chart]({e['url']})\n"
-        if len(ranked) > HOURLY_REPORT_MAX_LISTED:
-            alltime_section += f"...+{len(ranked) - HOURLY_REPORT_MAX_LISTED} more\n"
+    if not winners:
+        return header + "Nothing currently tracked has doubled this hour — quiet stretch, not necessarily a problem."
 
-    # ── This hour's snapshot ──────────────────────────────────────────────
-    hour_section = f"\n📈 *THIS HOUR* (currently up {HOURLY_REPORT_MIN_GAIN_PCT}%+)\n"
-    if not this_hour_winners:
-        hour_section += "Nothing cleared the bar this hour — quiet stretch, not necessarily a problem."
-    else:
-        for i, s in enumerate(this_hour_winners, 1):
-            hour_section += (
-                f"{i}. *{s['symbol']}* — +{s['gain_pct']:.0f}% "
-                f"(mcap ${s['mcap']:,.0f}) [chart]({s['url']})\n"
-            )
-
-    return header + alltime_section + hour_section
+    body = ""
+    for i, s in enumerate(winners, 1):
+        body += (
+            f"{i}. *{s['symbol']}* — +{s['gain_pct']:.0f}% "
+            f"(mcap ${s['mcap']:,.0f}) [chart]({s['url']})\n"
+        )
+    return header + body
 
 
-def format_daily_top_performers_report() -> str:
-    """Top tokens by peak multiplier ('Xs') reached in the last 24 hours.
-    Built entirely from the persistent _all_time_2x_log (which already
-    records every milestone hit with a timestamp) — this only READS that
-    list, never modifies or prunes it, so the existing hourly report's own
-    all-time section is completely unaffected by this function existing."""
-    cutoff = time.time() - 24 * 3600
+def format_runners_report(window_hours: float, title: str) -> str:
+    """Top tokens by peak multiplier ('Xs') reached within the given
+    lookback window (in hours), built entirely from the persistent
+    _all_time_2x_log (already timestamped) — read-only, never prunes
+    that list, so nothing else reading it is affected. Used for both the
+    6-hour 'biggest runners' report and could serve any other window."""
+    cutoff = time.time() - window_hours * 3600
     recent = [e for e in _all_time_2x_log if e["timestamp"] >= cutoff]
 
-    header = (
-        f"🗓️ *24-HOUR TOP PERFORMERS*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-    )
+    header = f"{title}\n━━━━━━━━━━━━━━━━━━━━\n"
 
     if not recent:
-        return header + "No tokens hit 2x+ in the last 24 hours — quiet stretch, not necessarily a problem."
+        return header + (
+            f"No tokens hit 2x+ in the last {window_hours:g} hours — "
+            f"quiet stretch, not necessarily a problem."
+        )
 
     # Best (highest) milestone per token in the window, not every single
-    # threshold it passed through along the way — same approach as the
-    # hourly report's all-time section.
+    # threshold it passed through along the way.
     best_per_token = {}
     for entry in recent:
         addr = entry["address"]
@@ -2001,17 +2047,47 @@ def format_daily_top_performers_report() -> str:
     ranked = sorted(best_per_token.values(), key=lambda e: e["threshold"], reverse=True)
 
     body = ""
-    for i, e in enumerate(ranked[:DAILY_REPORT_MAX_LISTED], 1):
+    for i, e in enumerate(ranked[:RUNNERS_REPORT_MAX_LISTED], 1):
         body += (
             f"{i}. *{e['symbol']}* — `{e['threshold']:g}x` "
             f"(mcap ${e['mcap']:,.0f}) [chart]({e['url']})\n"
         )
-    if len(ranked) > DAILY_REPORT_MAX_LISTED:
-        body += f"...+{len(ranked) - DAILY_REPORT_MAX_LISTED} more hit 2x+ in the last 24h\n"
+    if len(ranked) > RUNNERS_REPORT_MAX_LISTED:
+        body += f"...+{len(ranked) - RUNNERS_REPORT_MAX_LISTED} more hit 2x+ in the last {window_hours:g}h\n"
 
-    body += f"\n📊 Total unique tokens that hit 2x+ in the last 24h: `{len(best_per_token)}`"
+    body += f"\n📊 Total unique tokens that hit 2x+ in the last {window_hours:g}h: `{len(best_per_token)}`"
 
     return header + body
+
+
+def format_alltime_summary_report(currently_tracking: int) -> str:
+    """The lifetime totals + full all-time 2x+ achievers list. This used
+    to be baked into EVERY hourly report (so the same big numbers repeated
+    24 times a day) — now it fires once every 24 hours on its own."""
+    header = (
+        f"📈 *24-HOUR ALL-TIME SUMMARY*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Total caught since bot started: `{_total_tokens_caught}`\n"
+        f"🚀 Total 2x+ hits since bot started: `{len(_all_time_2x_log)}`\n"
+        f"👀 Currently tracking: `{currently_tracking}` tokens\n\n"
+    )
+
+    alltime_section = "🏆 *ALL-TIME 2x+ ACHIEVERS*\n"
+    if not _all_time_2x_log:
+        alltime_section += "None yet.\n"
+    else:
+        best_per_token = {}
+        for entry in _all_time_2x_log:
+            addr = entry["address"]
+            if addr not in best_per_token or entry["threshold"] > best_per_token[addr]["threshold"]:
+                best_per_token[addr] = entry
+        ranked = sorted(best_per_token.values(), key=lambda e: e["threshold"], reverse=True)
+        for i, e in enumerate(ranked[:RUNNERS_REPORT_MAX_LISTED], 1):
+            alltime_section += f"{i}. *{e['symbol']}* — `{e['threshold']:g}x` (mcap ${e['mcap']:,.0f}) [chart]({e['url']})\n"
+        if len(ranked) > RUNNERS_REPORT_MAX_LISTED:
+            alltime_section += f"...+{len(ranked) - RUNNERS_REPORT_MAX_LISTED} more\n"
+
+    return header + alltime_section
 
 
 def format_multiplier_alert(pair: dict, threshold: float, state: dict, current_price: float, current_mcap: float) -> str:
@@ -2043,23 +2119,40 @@ async def process_new_token(
     token_address: str,
     manual_kw: set,
     auto_kw: set,
-) -> None:
+) -> Optional[bool]:
     """Runs every filter step for one newly-discovered token and sends the
     launch alert if it passes everything. Pulled out into its own function
     so the caller can wrap a single token's processing in a try/except —
     if any one token's data causes an unexpected error, only that token is
-    skipped, instead of it taking down the whole bot."""
+    skipped, instead of it taking down the whole bot.
+
+    Return value tells the caller whether to add this address to the
+    negative cache (REJECTED_TOKENS) so it isn't re-fetched every cycle:
+      - True  = passed everything, now in tracked_tokens (nothing to cache)
+      - False = failed for a reason that can ONLY get truer over time
+                (too old, bad security, bad lore, etc.) — safe to cache
+      - None  = failed for a reason that might resolve on its own soon
+                (not indexed yet, still too new, rugcheck data not up yet)
+                — do NOT cache, let it be re-checked next cycle
+    """
 
     # Step 1: DEX filters (fast, no extra API call)
     pairs = await fetch_token_pairs(session, token_address)
     if not pairs:
-        return
+        # Not indexed by DEXScreener yet — genuinely transient, don't cache
+        return None
     pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
 
     dex_ok, dex_reason = passes_dex_filters(pair)
     if not dex_ok:
         log.info(f"DEX fail [{token_address[:8]}]: {dex_reason}")
-        return
+        # "Too new" is the one DEX-filter failure that resolves itself
+        # (the token ages into the valid window) — everything else
+        # (too old, liquidity/volume/txns too low, no creation timestamp)
+        # only gets truer as time passes, so it's safe to cache.
+        if dex_reason.startswith("Too new"):
+            return None
+        return False
 
     # Step 2: Pre-bond filter
     prebond_ok, prebond_reason = passes_prebond_filter(pair)
@@ -2068,13 +2161,14 @@ async def process_new_token(
             f"Pre-bond fail [{token_address[:8]}]: {prebond_reason} "
             f"(dexId='{pair.get('dexId')}')"
         )
-        return
+        return False
 
     # Step 3: Rugcheck (security + lore data)
     report = await fetch_rugcheck(session, token_address)
     if not report:
         log.info(f"No Rugcheck data for {token_address[:8]}, skipping")
-        return
+        # Rugcheck may simply not have indexed this token yet — transient
+        return None
 
     sec = parse_rugcheck(report)
 
@@ -2082,13 +2176,13 @@ async def process_new_token(
     rug_ok, rug_reason = passes_rugcheck_filters(sec)
     if not rug_ok:
         log.info(f"Security fail [{token_address[:8]}]: {rug_reason}")
-        return
+        return False
 
     # Step 5: Lore filter
     lore_ok, lore_reason = passes_lore_filters(sec)
     if not lore_ok:
         log.info(f"Lore fail [{token_address[:8]}]: {lore_reason}")
-        return
+        return False
 
     # Step 5b: Duplicate/templated description check — catches rug-factory
     # templates (same blurb, name swapped) even when everything else about
@@ -2100,14 +2194,14 @@ async def process_new_token(
         )
         if is_dup:
             log.info(f"Duplicate description fail [{token_address[:8]}]: {dup_info}")
-            return
+            return False
 
     # Step 6: Trending lore check (informational, or hard filter if
     # TRENDING_LORE_ONLY is True)
     trend = check_trending_lore(pair, sec, manual_kw, auto_kw)
     if TRENDING_LORE_ONLY and not trend["is_trending"]:
         log.info(f"Trending fail [{token_address[:8]}]: no keyword match")
-        return
+        return False
 
     # NEW: meta classification — what narrative category (if any) does
     # this token belong to, and how "hot" has that category been recently
@@ -2169,14 +2263,16 @@ async def process_new_token(
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
+    return True
 
 
 async def run_bot():
-    global _last_hourly_report, _last_24h_report
-    _last_hourly_report = time.time()  # NEW: start the hourly clock now,
-                                        # not at 0 — otherwise the first
-                                        # report would fire immediately
-    _last_24h_report = time.time()     # NEW: same idea for the 24h report
+    global _last_hourly_report, _last_six_hour_report, _last_24h_report
+    _last_hourly_report = time.time()    # start the hourly clock now, not
+                                          # at 0 — otherwise the first
+                                          # report would fire immediately
+    _last_six_hour_report = time.time()  # same idea for the 6h runners report
+    _last_24h_report = time.time()       # same idea for the 24h summary report
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     log.info("🤖 Solana Memecoin Sniper Bot v5 started")
@@ -2207,11 +2303,29 @@ async def run_bot():
                 manual_kw, auto_kw = await get_trending_keywords(session)
 
                 # ── 1. NEW LAUNCH SCAN ────────────────────────────────────
+                # NEW: pull from BOTH DEXScreener discovery feeds (profiles
+                # + boosts) and merge/dedupe them into one candidate list,
+                # widening the pool instead of relying on profiles alone.
                 profiles = await fetch_new_solana_profiles(session)
+                boosts   = await fetch_boosted_solana_tokens(session)
 
-                for profile in profiles:
-                    token_address = profile.get("tokenAddress")
-                    if not token_address or token_address in tracked_tokens:
+                seen_this_cycle = set()
+                candidates = []
+                for item in profiles + boosts:
+                    addr = item.get("tokenAddress")
+                    if addr and addr not in seen_this_cycle:
+                        seen_this_cycle.add(addr)
+                        candidates.append(addr)
+
+                # NEW: sweep expired negative-cache entries once per cycle
+                prune_rejected_tokens()
+
+                for token_address in candidates:
+                    if (
+                        not token_address
+                        or token_address in tracked_tokens
+                        or is_rejected(token_address)
+                    ):
                         continue
 
                     # NEW: wrapping each token's processing individually —
@@ -2220,9 +2334,17 @@ async def run_bot():
                     # token and keep the bot running, instead of the whole
                     # process crashing.
                     try:
-                        await process_new_token(
+                        result = await process_new_token(
                             session, bot, token_address, manual_kw, auto_kw
                         )
+                        # False = permanently disqualified (e.g. too old,
+                        # bad security/lore) — remember it so we stop
+                        # re-fetching and re-logging the same dead token
+                        # every cycle. True/None are left uncached: True is
+                        # already in tracked_tokens, None means "might
+                        # still resolve, check again next cycle."
+                        if result is False:
+                            mark_rejected(token_address)
                     except (Exception, asyncio.CancelledError, asyncio.TimeoutError) as e:
                         log.error(f"Token processing error [{token_address[:8]}]: {e}")
                         continue
@@ -2389,7 +2511,7 @@ async def run_bot():
                 for key in stale:
                     del tracked_tokens[key]
 
-                # ── 3. HOURLY REPORT (NEW) ─────────────────────────────────
+                # ── 3. HOURLY REPORT (CHANGED — now just 2x+ movers) ────────
                 if time.time() - _last_hourly_report >= HOURLY_REPORT_INTERVAL_SEC:
                     if hourly_snapshot:
                         await bot.send_message(
@@ -2400,14 +2522,30 @@ async def run_bot():
                         )
                     _last_hourly_report = time.time()
 
-                # ── 4. 24-HOUR TOP PERFORMERS REPORT (NEW) ─────────────────
+                # ── 4. 6-HOUR BIGGEST RUNNERS REPORT (CHANGED — was 24h) ────
                 # Independent of hourly_snapshot/tracked_tokens — reads only
                 # the persistent _all_time_2x_log, so it works regardless of
                 # the 6-hour tracked-tokens cleanup above.
-                if time.time() - _last_24h_report >= DAILY_REPORT_INTERVAL_SEC:
+                if time.time() - _last_six_hour_report >= SIX_HOUR_REPORT_INTERVAL_SEC:
                     await bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=format_daily_top_performers_report(),
+                        text=format_runners_report(
+                            window_hours=6,
+                            title="🗓️ *BIGGEST RUNNERS — LAST 6 HOURS*",
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                        disable_web_page_preview=True,
+                    )
+                    _last_six_hour_report = time.time()
+
+                # ── 5. 24-HOUR ALL-TIME SUMMARY REPORT (CHANGED — this used
+                # to be baked into every single hourly report) ─────────────
+                if time.time() - _last_24h_report >= ALLTIME_REPORT_INTERVAL_SEC:
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=format_alltime_summary_report(
+                            currently_tracking=len(tracked_tokens)
+                        ),
                         parse_mode=ParseMode.MARKDOWN,
                         disable_web_page_preview=True,
                     )
