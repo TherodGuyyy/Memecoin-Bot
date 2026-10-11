@@ -104,6 +104,39 @@ async def send_with_retry(bot, chat_id, text, parse_mode=None, disable_web_page_
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+# ─── SILU LINK (optional) ────────────────────────────────────────────────────
+# When both are set, every alert this bot sends is also reported to your Silu
+# site, so Silu shows exactly the tokens this bot alerted. If either is empty
+# the bot behaves exactly as before.
+SILU_URL        = (os.getenv("SILU_URL", "") or "").strip().rstrip("/")
+SILU_BOT_SECRET = (os.getenv("SILU_BOT_SECRET", "") or "").strip()
+
+
+async def notify_silu(payload: dict) -> None:
+    """Fire-and-forget: tell Silu about an alert. Never raises, never delays Telegram.
+    Retries a few times because a sleeping Render site needs up to a minute to wake up."""
+    if not SILU_URL or not SILU_BOT_SECRET:
+        return
+    url = (SILU_URL if SILU_URL.lower().startswith("http") else "https://" + SILU_URL) + "/api/bot-alert"
+    body = dict(payload)
+    body["secret"] = SILU_BOT_SECRET
+    for attempt in range(1, 4):
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(url, json=body, timeout=aiohttp.ClientTimeout(total=25)) as r:
+                    if r.status < 300:
+                        return
+                    log.warning(f"notify_silu: HTTP {r.status} (try {attempt})")
+                    if r.status in (401, 404):
+                        return          # wrong secret / link not switched on at Silu: retrying will not help
+        except Exception as e:
+            log.warning(f"notify_silu failed (try {attempt}): {e!r}")
+        await asyncio.sleep(5)
+
+
+# ─── CONFIG (continued) ───────────────────────────────────────────────────────
+
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
 # NOTE: previously had your real token/chat ID hardcoded as fallback
 # defaults here — removed since this file is going to GitHub. Set both as
@@ -1051,6 +1084,8 @@ async def process_new_gmgn_token(bot: Bot, token: dict) -> None:
         "alerted_multiples":   set(),
         "pair_address":        token.get("pool_address"),
     }
+
+    asyncio.create_task(notify_silu({"src": "gmgn", "token": token}))
 
     sym = token.get("symbol", "?")
     log.info(f"🟣 GMGN ALERT: {sym} ({token_address[:8]}...) | mcap=${mcap:,.0f}")
@@ -2243,6 +2278,8 @@ async def process_new_token(
         "alerted_multiples":   set(),
         "pair_address":        pair.get("pairAddress"),
     }
+
+    asyncio.create_task(notify_silu({"src": "dex", "mint": token_address}))
 
     sym = pair.get("baseToken", {}).get("symbol", "?")
     log.info(
